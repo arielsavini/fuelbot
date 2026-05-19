@@ -232,6 +232,37 @@
       border-radius: 8px; border: 1px solid var(--border);
       line-height: 1.7; margin-top: 10px;
     }
+
+    /* ── GARMIN BLE ── */
+    .btn-connect-ble {
+      width: 100%; padding: 11px; margin-top: 10px;
+      background: rgba(34,197,94,.1); color: var(--safe);
+      border: 1.5px solid rgba(34,197,94,.35); border-radius: 10px;
+      font-family: 'Space Mono', monospace; font-size: 12px; font-weight: 700;
+      cursor: pointer; transition: all .15s; letter-spacing: .5px;
+    }
+    .btn-connect-ble:hover  { background: rgba(34,197,94,.2); }
+    .btn-connect-ble:disabled { opacity: .45; cursor: not-allowed; }
+    .ble-status {
+      margin-top: 7px; font-size: 11px; font-family: 'Space Mono', monospace;
+      color: var(--muted); text-align: center; min-height: 16px;
+    }
+    .garmin-run-badge {
+      display: none; align-items: center; gap: 6px; margin-top: 8px;
+      font-size: 10px; font-family: 'Space Mono', monospace; color: var(--safe);
+      border: 1px solid rgba(34,197,94,.4); padding: 4px 12px; border-radius: 20px;
+      background: rgba(34,197,94,.08);
+    }
+    .garmin-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--safe);
+      animation: blink 1.5s ease infinite;
+    }
+    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.25; } }
+
+    /* ── STATS ROW (4-col when HR visible) ── */
+    .stats-row.with-hr { grid-template-columns: repeat(2, 1fr); }
+    .stat-box--hr { display: none; }
+    .stat-box--hr.visible { display: block; }
   </style>
 </head>
 <body>
@@ -272,10 +303,23 @@
     <div class="card-label">📱 Modo de detección</div>
     <div class="chip-row" id="sensorRow">
       <button class="chip active" data-sensor="motion">Acelerómetro</button>
+      <button class="chip" data-sensor="garmin">Garmin BLE</button>
       <button class="chip" data-sensor="sim">Simulación (demo)</button>
     </div>
     <div class="perm-note" id="permNote">
       FuelBot usa el acelerómetro de tu celular para detectar pasos en tiempo real y calcular fatiga. En iOS se pedirá permiso al iniciar.
+    </div>
+
+    <!-- Garmin BLE card (visible solo cuando se elige Garmin) -->
+    <div id="garminSetupCard" style="display:none;margin-top:10px">
+      <div class="field" style="margin-bottom:10px">
+        <label>FC máxima (ppm)</label>
+        <input type="number" id="inpHRMax" value="185" min="140" max="220" />
+      </div>
+      <button class="btn-connect-ble" id="btnConnectGarmin">
+        📶 Conectar Forerunner 255
+      </button>
+      <div class="ble-status" id="bleStatusText">Presioná para buscar el reloj vía Bluetooth</div>
     </div>
   </div>
 
@@ -300,9 +344,12 @@
     <div class="sim-badge" id="simBadge">
       <div class="sim-dot"></div> SIMULACIÓN ACTIVA
     </div>
+    <div class="garmin-run-badge" id="garminRunBadge">
+      <div class="garmin-dot"></div> <span id="garminDeviceName">GARMIN</span> CONECTADO
+    </div>
   </div>
 
-  <div class="stats-row">
+  <div class="stats-row" id="statsRow">
     <div class="stat-box">
       <div class="stat-val" id="statCadence">—</div>
       <div class="stat-lbl">SPM</div>
@@ -314,6 +361,10 @@
     <div class="stat-box">
       <div class="stat-val" id="statDrop">—</div>
       <div class="stat-lbl">CAÍDA CAD.</div>
+    </div>
+    <div class="stat-box stat-box--hr" id="statBoxHR">
+      <div class="stat-val" id="statHR">—</div>
+      <div class="stat-lbl">FC (PPM)</div>
     </div>
   </div>
 
@@ -371,7 +422,7 @@
 
 <script>
 // ── STATE ──
-const cfg = { weight: 70, temp: 20, dist: 21, sensor: 'motion' };
+const cfg = { weight: 70, temp: 20, dist: 21, sensor: 'motion', hrMax: 185 };
 let running = false, startTime = 0;
 let lastDrinkTime = 0, lastGelTime = 0;
 let totalSteps = 0, waterCount = 0, gelCount = 0, maxFatigue = 0;
@@ -379,9 +430,15 @@ let baselineCadence = 0;
 const baselineSamples = [];
 let timerInterval = null, updateInterval = null, simInterval = null;
 
-// Step tracking
+// Step tracking (acelerómetro)
 const stepIntervals = [];
 let lastStepTime = 0, peakActive = false, smoothMag = 9.8;
+
+// ── BLE / GARMIN STATE ──
+let bleDevice = null, garminConnected = false;
+let currentHR = 0, currentBLECadence = 0, lastRSCTime = 0;
+const bleCadenceHistory = []; // historial de cadencia BLE para variabilidad
+const hrSamples = [];         // para calcular FC media en resumen
 
 // ── STEP DETECTION ──
 const PEAK_THRESHOLD = 13.5;
@@ -425,18 +482,105 @@ function startSimulation() {
   }, 350);
 }
 
+// ── GARMIN BLE ──
+async function connectGarmin() {
+  if (!navigator.bluetooth) {
+    alert('Web Bluetooth no está disponible.\nUsá Chrome en Android con HTTPS.');
+    return;
+  }
+  const btn = document.getElementById('btnConnectGarmin');
+  const status = document.getElementById('bleStatusText');
+  btn.disabled = true;
+  status.textContent = 'Buscando Forerunner 255…';
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: ['heart_rate'] }],
+      optionalServices: ['running_speed_and_cadence']
+    });
+    status.textContent = 'Conectando…';
+    const server = await bleDevice.gatt.connect();
+
+    // Heart Rate (0x180D)
+    try {
+      const hrSvc = await server.getPrimaryService('heart_rate');
+      const hrChar = await hrSvc.getCharacteristic('heart_rate_measurement');
+      await hrChar.startNotifications();
+      hrChar.addEventListener('characteristicvaluechanged', onHRUpdate);
+    } catch { console.log('HR service no disponible'); }
+
+    // Running Speed & Cadence (0x1814)
+    try {
+      const rscSvc = await server.getPrimaryService('running_speed_and_cadence');
+      const rscChar = await rscSvc.getCharacteristic('rsc_measurement');
+      await rscChar.startNotifications();
+      rscChar.addEventListener('characteristicvaluechanged', onRSCUpdate);
+    } catch { console.log('RSC service no disponible'); }
+
+    garminConnected = true;
+    const name = bleDevice.name || 'Garmin';
+    status.textContent = `✓ ${name} conectado — listo para correr`;
+    status.style.color = 'var(--safe)';
+    btn.textContent = `✓ ${name}`;
+    bleDevice.addEventListener('gattserverdisconnected', onGarminDisconnected);
+  } catch (e) {
+    status.textContent = 'Error: asegurate de iniciar una actividad en el reloj primero.';
+    status.style.color = 'var(--danger)';
+    btn.disabled = false;
+    console.error(e);
+  }
+}
+
+function onHRUpdate(e) {
+  const v = e.target.value;
+  const flags = v.getUint8(0);
+  currentHR = (flags & 0x1) ? v.getUint16(1, true) : v.getUint8(1);
+  hrSamples.push(currentHR);
+  if (hrSamples.length > 60) hrSamples.shift();
+  if (running) document.getElementById('statHR').textContent = currentHR;
+}
+
+function onRSCUpdate(e) {
+  const now = Date.now();
+  const v = e.target.value;
+  // Byte 3 = Instantaneous Cadence (strides/min) ×2 = pasos/min
+  const strides = v.getUint8(3);
+  currentBLECadence = strides * 2;
+  bleCadenceHistory.push(currentBLECadence);
+  if (bleCadenceHistory.length > 20) bleCadenceHistory.shift();
+  // Acumular pasos por tiempo transcurrido desde última notificación
+  if (lastRSCTime > 0 && running) {
+    totalSteps += Math.round(((now - lastRSCTime) / 60000) * currentBLECadence);
+  }
+  lastRSCTime = now;
+}
+
+function onGarminDisconnected() {
+  garminConnected = false;
+  currentHR = 0; currentBLECadence = 0;
+  document.getElementById('garminRunBadge').style.display = 'none';
+  // Fallback al acelerómetro si la carrera sigue
+  if (running) window.addEventListener('devicemotion', handleMotion);
+  showAlert('⚠️ Garmin desconectado — usando acelerómetro');
+}
+
 // ── CADENCE + VARIABILITY ──
 function getCadence() {
+  // Prioridad: BLE > acelerómetro
+  if (garminConnected && currentBLECadence > 0) return currentBLECadence;
   if (stepIntervals.length < 3) return 0;
   const recent = stepIntervals.slice(-10);
   return Math.round(60000 / (recent.reduce((a, b) => a + b, 0) / recent.length));
 }
 
 function getCadenceCV() {
-  if (stepIntervals.length < 5) return 0;
-  const recent = stepIntervals.slice(-15);
-  const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-  const sd = Math.sqrt(recent.reduce((a, b) => a + (b - mean) ** 2, 0) / recent.length);
+  // Usar historial BLE si disponible (más preciso)
+  const data = (garminConnected && bleCadenceHistory.length >= 5)
+    ? bleCadenceHistory.slice(-15)
+    : stepIntervals.slice(-15);
+  if (data.length < 5) return 0;
+  const mean = data.reduce((a, b) => a + b, 0) / data.length;
+  if (mean === 0) return 0;
+  const sd = Math.sqrt(data.reduce((a, b) => a + (b - mean) ** 2, 0) / data.length);
   return sd / mean;
 }
 
@@ -460,6 +604,18 @@ function getFatigue() {
   // Heat factor
   const heatFactor = Math.max(0, (cfg.temp - 20) / 25);
 
+  // FC factor (solo si hay dato Garmin): 0 en ≤70% FC máx, 1 en ≥95%
+  let hrFactor = 0;
+  if (garminConnected && currentHR > 0 && cfg.hrMax > 0) {
+    hrFactor = Math.min(1, Math.max(0, (currentHR / cfg.hrMax - 0.70) / 0.25));
+  }
+
+  // Pesos ajustados según disponibilidad de FC
+  if (hrFactor > 0) {
+    return Math.min(100, Math.max(0, Math.round(
+      (cadDrop * 0.30 + varFactor * 0.20 + hrFactor * 0.25 + timeFactor * 0.15 + heatFactor * 0.10) * 100
+    )));
+  }
   return Math.min(100, Math.max(0,
     Math.round((cadDrop * 0.40 + varFactor * 0.30 + timeFactor * 0.20 + heatFactor * 0.10) * 100)
   ));
@@ -515,6 +671,13 @@ function updateUI() {
   // Stats
   document.getElementById('statCadence').textContent = cadence > 0 ? cadence : '—';
   document.getElementById('statSteps').textContent = totalSteps;
+  // FC en tiempo real (si Garmin conectado)
+  if (garminConnected && currentHR > 0) {
+    document.getElementById('statHR').textContent = currentHR;
+    const hrPct = cfg.hrMax > 0 ? currentHR / cfg.hrMax : 0;
+    document.getElementById('statHR').style.color =
+      hrPct > 0.90 ? 'var(--danger)' : hrPct > 0.80 ? 'var(--warn)' : 'var(--safe)';
+  }
 
   const dropPct = baselineCadence > 0 && cadence > 0
     ? Math.round((baselineCadence - cadence) / baselineCadence * 100) : null;
@@ -598,13 +761,26 @@ async function startSession() {
   totalSteps = waterCount = gelCount = maxFatigue = 0;
   baselineCadence = 0; baselineSamples.length = 0;
   stepIntervals.length = 0; lastStepTime = 0; smoothMag = 9.8;
+  bleCadenceHistory.length = 0; hrSamples.length = 0; lastRSCTime = 0; currentHR = 0;
 
   document.getElementById('setupPanel').classList.remove('active');
   document.getElementById('runPanel').style.display = 'block';
 
+  // Mostrar badge según modo
+  if (cfg.sensor === 'garmin' && garminConnected) {
+    const badge = document.getElementById('garminRunBadge');
+    badge.style.display = 'flex';
+    document.getElementById('garminDeviceName').textContent =
+      bleDevice ? (bleDevice.name || 'GARMIN').toUpperCase() : 'GARMIN';
+    // Activar HR stat box
+    const hrBox = document.getElementById('statBoxHR');
+    hrBox.classList.add('visible');
+    document.getElementById('statsRow').classList.add('with-hr');
+  }
+
   if (cfg.sensor === 'sim') {
     startSimulation();
-  } else {
+  } else if (cfg.sensor === 'motion') {
     window.addEventListener('devicemotion', handleMotion);
   }
 
@@ -620,13 +796,28 @@ function stopSession() {
   clearInterval(updateInterval);
   clearInterval(simInterval);
   window.removeEventListener('devicemotion', handleMotion);
+  // Desconectar BLE (mantiene el pairing para próxima sesión)
+  if (bleDevice && bleDevice.gatt.connected) {
+    bleDevice.removeEventListener('gattserverdisconnected', onGarminDisconnected);
+    bleDevice.gatt.disconnect();
+  }
   document.getElementById('simBadge').style.display = 'none';
+  document.getElementById('garminRunBadge').style.display = 'none';
+  document.getElementById('statBoxHR').classList.remove('visible');
+  document.getElementById('statsRow').classList.remove('with-hr');
   document.getElementById('runPanel').style.display = 'none';
   document.getElementById('summaryPanel').classList.add('active');
 
   const elapsed = Math.floor((Date.now() - startTime) / 1000);
-  const avgCad = stepIntervals.length > 3
-    ? Math.round(60000 / (stepIntervals.reduce((a, b) => a + b, 0) / stepIntervals.length)) : 0;
+  // Cadencia media: BLE o acelerómetro
+  let avgCad = 0;
+  if (bleCadenceHistory.length > 3) {
+    avgCad = Math.round(bleCadenceHistory.reduce((a,b)=>a+b,0) / bleCadenceHistory.length);
+  } else if (stepIntervals.length > 3) {
+    avgCad = Math.round(60000 / (stepIntervals.reduce((a,b)=>a+b,0) / stepIntervals.length));
+  }
+  const avgHR = hrSamples.length > 0
+    ? Math.round(hrSamples.reduce((a,b)=>a+b,0) / hrSamples.length) : 0;
 
   document.getElementById('summarySubtitle').textContent =
     cfg.dist > 0 ? `Objetivo: ${cfg.dist} km` : 'Sesión libre';
@@ -636,7 +827,11 @@ function stopSession() {
   document.getElementById('sCadence').textContent = avgCad > 0 ? avgCad : '—';
   document.getElementById('sFatigue').textContent = maxFatigue;
   document.getElementById('sWater').textContent   = waterCount;
-  document.getElementById('sGels').textContent    = gelCount;
+  document.getElementById('sGels').textContent    = avgHR > 0 ? `${avgHR} ppm` : gelCount;
+  // Cambiar label último stat si hay FC
+  if (avgHR > 0) {
+    document.querySelector('#summaryPanel .summary-stat:last-of-type .lbl').textContent = 'FC media';
+  }
 }
 
 // ── HANDLERS ──
@@ -669,9 +864,14 @@ document.getElementById('sensorRow').addEventListener('click', e => {
   const b = e.target.closest('.chip'); if (!b) return;
   document.querySelectorAll('#sensorRow .chip').forEach(x => x.classList.remove('active'));
   b.classList.add('active'); cfg.sensor = b.dataset.sensor;
-  document.getElementById('permNote').textContent = cfg.sensor === 'sim'
-    ? 'Modo demo: simula pasos con cadencia variable decreciente para probar la app sin moverse.'
-    : 'FuelBot usa el acelerómetro de tu celular para detectar pasos en tiempo real y calcular fatiga. En iOS se pedirá permiso al iniciar.';
+  const garminCard = document.getElementById('garminSetupCard');
+  garminCard.style.display = cfg.sensor === 'garmin' ? 'block' : 'none';
+  const notes = {
+    motion:  'FuelBot usa el acelerómetro de tu celular para detectar pasos en tiempo real y calcular fatiga. En iOS se pedirá permiso al iniciar.',
+    garmin:  'Conectá tu Forerunner 255 vía Bluetooth. Iniciá una actividad en el reloj antes de presionar Conectar.',
+    sim:     'Modo demo: simula pasos con cadencia variable decreciente para probar la app sin moverse.',
+  };
+  document.getElementById('permNote').textContent = notes[cfg.sensor];
 });
 
 document.getElementById('btnNewRun').addEventListener('click', () => {
@@ -683,7 +883,20 @@ document.getElementById('btnNewRun').addEventListener('click', () => {
   document.getElementById('timerDisplay').textContent = '00:00';
   document.getElementById('fatigueStatus').textContent = 'PREPARANDO…';
   document.getElementById('cardWall').style.display = 'none';
+  document.getElementById('statBoxHR').classList.remove('visible');
+  document.getElementById('statsRow').classList.remove('with-hr');
+  // Resetear label del último summary stat
+  document.querySelector('#summaryPanel .summary-stat:last-of-type .lbl').textContent = 'Geles';
+  // Desconectar BLE al resetear
+  garminConnected = false; currentHR = 0; currentBLECadence = 0;
+  bleDevice = null;
+  const bleStatusEl = document.getElementById('bleStatusText');
+  if (bleStatusEl) { bleStatusEl.textContent = 'Presioná para buscar el reloj vía Bluetooth'; bleStatusEl.style.color = ''; }
+  const btnCG = document.getElementById('btnConnectGarmin');
+  if (btnCG) { btnCG.disabled = false; btnCG.textContent = '📶 Conectar Forerunner 255'; }
 });
+
+document.getElementById('btnConnectGarmin').addEventListener('click', connectGarmin);
 
 // SW
 if ('serviceWorker' in navigator) {
